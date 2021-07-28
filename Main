@@ -1,0 +1,1076 @@
+!pip install tensorflow
+!pip install chess
+!pip install tensorflow-gpu
+!pip install matplotlib
+!pip install numpy
+
+
+############ Libraries ############
+
+import numpy as np
+import tensorflow as tf
+
+import math
+import random
+import time
+import chess
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Conv2D, Flatten, BatchNormalization, LeakyReLU, add
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import regularizers
+
+import matplotlib.pyplot as plt
+
+
+from copy import copy
+from collections import deque
+import pickle
+
+from IPython.display import clear_output
+
+
+
+# ############ Hyper Parameters ############
+
+# MODEL_UPDATES = 20            # Number of times the model is updated
+# NUM_RES_LAYER = 20            # Number of Residual Layer for the model
+
+# #### SELF PLAY
+# EPISODES = 15                 # Amount of selfplay-games before updating the model
+# NUM_SIMULATIONS = 50          # Amount of simulations each turn
+# MEMORY_SIZE = 30000           # Maximum size of memory
+# TURNS_UNTIL_NOT_RANDOM = 8    # Amount of turns before model plays deterministically
+# CONST = 3.5                   # Constant for MCTS-algorithm 
+# EPSILON = 0.2                 # Parameter for MCTS-algorithm
+# ALPHA = 0.9                   # Parameter for MCTS-algorithm 
+
+# # RETRAINING
+# STARTING_MEMORY_SIZE = 2000   # Size of memory before model starts learning
+# BATCH_SIZE_1 = 1024           # Size of minibatch from memory (minibatch1)
+# BATCH_SIZE_2 = 256            # Size of minibatch from minibatch1 (minibatch2)
+# EPOCHS = 2                    # Number of times the minibatch2 is used for updating the model parameters
+# TRAINING_LOOPS = 15           # Number of times we sample minibatch1 from memory for updating the model
+# REG_CONST = 0.00001           # Weight of the L2-regularization term
+# LEARNING_RATE = 0.00001       # Learning rate for Adam optimizer
+# BETA_1 = 0.9                  # Parameter for Adam optimizer
+# BETA_2 = 0.999                # Parameter for Adam optimizer
+# CLIP_NORM = 1                 # Gradient Clipping parameter
+
+# # EVALUATION
+# START_EVALUATION = 4          # After (START_EVALUATION * EPISODES) Games the model gets evaluated
+# EVAL_EPISODES = 10            # Amount of games played to determine the better player after updating one model
+# SCORING_THRESHOLD = 1.3       # The new model is used if: new_model_wins/old_model_wins > SCORING_THRESHOLD
+
+
+
+############ Converting Chessboard to input tensor ############
+
+def ind2sub(ind):
+    if ind<40:
+        rows = 5
+    else:
+        rows = 2
+    cols = ind % 8
+    return (rows, cols)
+
+def FEN_converter(board):
+    array = np.zeros((8,8,21),dtype = 'float64')
+
+    
+# First 12 Channels for piece location
+    fen = board.board_fen().split("/")
+    list = 'P R N B Q K p r n b q k'
+    list = list.split()
+    for i in range(0, len(fen)): 
+        line=fen[i].replace("1",'0').replace('2','00').replace("3","000").replace("3","000").replace('4','0000').replace('5','00000').replace('6','000000').replace('7','0000000').replace('8','00000000')
+        for j in range(0,len(line)):
+            for k in range(0,len(list)):
+                if line[j] == list[k]:
+                    array[i,j,k] = 1
+                    
+# Channel for en passant
+    en_passant = board.ep_square 
+    if en_passant is not None:
+        sub = ind2sub(en_passant)
+        array[sub[0],sub[1],12] = 1
+        
+# 4 Channels for castling rights        
+    castling = [board.has_kingside_castling_rights(chess.WHITE),board.has_queenside_castling_rights(chess.WHITE),board.has_kingside_castling_rights(chess.BLACK),board.has_queenside_castling_rights(chess.BLACK)]
+    for i in range(0,len(castling)):
+        if castling[i] is True:
+            array[:,:,i+13]=np.ones((8,8))
+
+# 2 Channels for turn order
+    if board.turn is True:
+        array[:,:,17]=np.ones((8,8))
+    if board.turn is False:
+        array[:,:,18]=np.ones((8,8))    
+    
+# Channel for fifty move rule
+    if board.can_claim_fifty_moves() is True:
+        array[:,:,19]=np.ones((8,8))
+    
+# Channel for threefold repetition rule
+    if board.can_claim_threefold_repetition() is True:
+        array[:,:,20]=np.ones((8,8))
+        
+    return array
+
+
+
+############ Convert the index ((-,-,-)-tuple) (representing an action in the output tensor) to an string (e.g. 'e2e4', 'd7d8q') ############
+
+def array_index_to_move(board, action):
+    
+    index = action
+    
+    legal_queen = list()
+    for move in board.legal_moves:
+        # test for queen promotions
+        if str(move)[-1] == 'q':
+            legal_queen.append(str(move))
+    
+    # converts the start position to chess notation
+    position = str(index[1]).replace('0', 'a').replace('1', 'b').replace('2', 'c').replace('3', 'd').replace('4', 'e').replace('5', 'f').replace('6', 'g').replace('7', 'h')+str(8-index[0])
+
+    # saves straight and diagonal movements (clockwise, starting with forward movement) 
+    if index[2] in range(0,7):
+        position = position + str(index[1]) + str(8-index[0]+index[2]+1)
+    if index[2] in range(7,14):
+        position = position + str(index[1]+index[2]-6) + str(8-index[0]+index[2]-6)
+    if index[2] in range(14,21):
+        position = position + str(index[1]+index[2]-13) + str(8-index[0])
+    if index[2] in range(21,28):
+        position = position + str(index[1]+index[2]-20) + str(8-index[0]-(index[2]-20))
+    if index[2] in range(28,35):
+        position = position + str(index[1]) + str(8-index[0]-(index[2]-27))
+    if index[2] in range(35,42):
+        position = position + str(index[1]-(index[2]-34)) + str(8-index[0]-(index[2]-34))
+    if index[2] in range(42,49):
+        position = position + str(index[1]-(index[2]-41)) + str(8-index[0])
+    if index[2] in range(49,56):
+        position = position + str(index[1]-(index[2]-48)) + str(8-index[0]+index[2]-48)
+    
+    # knight movement (clockwise, starting with top top right)
+    if index[2] == 56:
+        position = position + str(index[1]+1) + str(8-index[0]+2)
+    if index[2] == 57:
+        position = position + str(index[1]+2) + str(8-index[0]+1)
+    if index[2] == 58:
+        position = position + str(index[1]+2) + str(8-index[0]-1)
+    if index[2] == 59:
+        position = position + str(index[1]+1) + str(8-index[0]-2)
+    if index[2] == 60:
+        position = position + str(index[1]-1) + str(8-index[0]-2)
+    if index[2] == 61:
+        position = position + str(index[1]-2) + str(8-index[0]-1)
+    if index[2] == 62:
+        position = position + str(index[1]-2) + str(8-index[0]+1)
+    if index[2] == 63:
+        position = position + str(index[1]-1) + str(8-index[0]+2)
+        
+    # promotion move (from left to right, rook, knight, bishop)
+    if index[2] in range(64,67):
+        position = position + str(index[1]+index[2]-65) + str(8-index[0]+1) + 'r'
+    if index[2] in range(67,70):
+        position = position + str(index[1]+index[2]-68) + str(8-index[0]+1) + 'n'
+    if index[2] in range(70,73):
+        position = position + str(index[1]+index[2]-71) + str(8-index[0]+1) + 'b'
+    
+    # replace matrix with chess notation    
+    position = position[0:2] + position[2].replace('0', 'a').replace('1', 'b').replace('2', 'c').replace('3', 'd').replace('4', 'e').replace('5', 'f').replace('6', 'g').replace('7', 'h') + position[3:len(position)]
+    
+    # queen promotion 
+    if position in str(legal_queen):
+        position = position + 'q'
+        
+    return position
+
+
+
+############ Convert string (e.g. 'e2e4', 'd7d8q') to an index ((-,-,-)-tuple) (representing an action in the output tensor) ############
+
+def move_to_array_index(move):
+    tensor = np.zeros((8,8,73))
+    
+    if(len(move) == 5):
+        var = move[4]
+        if(var == 'q'):
+            move = move[0:4]
+            a = True
+            
+    move_str = move.replace('a', '0').replace('b', '1').replace('c', '2').replace('d', '3').replace('e', '4').replace('f', '5').replace('g', '6').replace('h', '7')
+
+    i = 8 - int(move_str[1])
+    j = int(move_str[0])
+
+    i2 = 8 - int(move_str[3])
+    j2 = int(move_str[2])
+    
+    if(len(move_str) == 4):
+        # up and down movement
+        if (i2-i != 0 and j2-j == 0):
+            distance = i-i2 
+            if distance > 0:
+                tensor[i,j,distance-1] = 1
+            else:
+                tensor[i,j,27-distance] = 1
+
+        #right and left movement
+        if (i2-i == 0 and j2-j != 0):
+            distance = j2-j
+            if distance > 0:
+                tensor[i,j,13+distance] = 1
+            else:
+                tensor[i,j,41-distance] = 1
+
+        #top left and bottom right movement
+        if (i2-i == j2-j):
+            distance = j-j2
+            if distance > 0:
+                tensor[i,j,48+distance] = 1
+            else:
+                tensor[i,j,20-distance] = 1
+
+        #top right and bottom left movement
+        if (i2-i == j-j2):
+            distance = j-j2
+            if distance > 0:
+                tensor[i,j,34+distance] = 1
+            else:
+                tensor[i,j,6-distance] = 1
+
+        #knight movement
+        if (i-i2 == 2 and j2-j == 1):
+            tensor[i,j,56] = 1
+        elif(i-i2 == 1 and j2-j == 2):
+            tensor[i,j,57] = 1
+        elif(i-i2 == -1 and j2-j == 2):
+            tensor[i,j,58] = 1
+        elif(i-i2 == -2 and j2-j == 1):
+            tensor[i,j,59] = 1
+        elif(i-i2 == -2 and j2-j == -1):
+            tensor[i,j,60] = 1
+        elif(i-i2 == -1 and j2-j == -2):
+            tensor[i,j,61] = 1
+        elif(i-i2 == 1 and j2-j == -2):
+            tensor[i,j,62] = 1
+        elif(i-i2 == 2 and j2-j == -1):
+            tensor[i,j,63] = 1
+    
+    else:
+        #rook promotion movement
+        if(var == 'r'):
+            tensor[i,j,65+(j2-j)] = 1
+            
+        #knight promotion movement
+        if(var == 'n'):
+            tensor[i,j,68+(j2-j)] = 1
+            
+        #bishop promotion movement
+        if(var == 'b'):
+            tensor[i,j,71+(j2-j)] = 1
+    try:
+        index = np.where(tensor == 1)
+        ind = list(zip(index[0], index[1], index[2]))[0]
+    except:
+        if a:
+            move = move + 'q'
+        print(move)
+        index = np.where(tensor == 1)
+        ind = list(zip(index[0], index[1], index[2]))[0]
+        
+    return ind
+
+
+############ Defining the neural network ############
+
+class myModel():
+      
+    def __init__(self):
+        self.reg_const = REG_CONST # regularization constant for l2-regularization
+        self.learning_rate = LEARNING_RATE
+        self.input_dim = (8,8,21) # 1 layer for each piece equals 12, 1 layer for en-passant, 4 layers for castling rights, 2 layers for player turn, 1 layer for threefold repetition, 1 layer for 50-move-rule ==> 12+1+4+2+1+1 = 21 layers
+        self.output_dim = (8,8,73) # each layer represents one type of moving (e.g. 1 field up, 7 fields down, 4 fields diagonally to the top left, knight move to the top right, rook-promotion with 1 field up, .....): first 56 layers: 8 directions times (max) 7 steps, 8 layers for knight movement, 9 layers for promotion (rook, knight, bishop) in 3 directions
+        
+        self.model = self._build_model() 
+        
+    # 2 convolutional layers (including batch normalization and leaky relu) with (add) skip connection 
+    def residual_layer(self, input_block, filters, kernel_size):
+
+        x = self.conv_layer(input_block, filters, kernel_size)
+        
+        x = Conv2D(
+        filters = filters
+        , kernel_size = kernel_size
+        , padding = 'same'
+        , use_bias=False
+        , activation='linear'
+        , kernel_regularizer = regularizers.l2(self.reg_const)
+        )(x)
+
+        x = BatchNormalization()(x)
+
+        x = add([input_block, x])
+
+        x = LeakyReLU()(x)
+
+        return (x)
+    
+    # Convolutional layer with batch normalization and leaky relu
+    def conv_layer(self, x, filters, kernel_size):
+        
+        
+        
+        x = Conv2D(
+        filters = filters
+        , kernel_size = kernel_size
+        , padding = 'same'
+        , use_bias=False
+        , activation='linear'
+        , kernel_regularizer = regularizers.l2(self.reg_const)
+        )(x)
+
+        x = BatchNormalization()(x)
+        x = LeakyReLU()(x)
+
+        return (x)
+    
+    # convert the output tensor to a value for predicting the outcome of each game using flatten and leaky relu
+    def value_head(self, x):
+
+        
+        
+        x = Conv2D(
+        filters = 1
+        , kernel_size = (1,1)
+        , padding = 'same'
+        , use_bias=False
+        , activation='linear'
+        , kernel_regularizer = regularizers.l2(self.reg_const)
+        )(x)
+
+        x = BatchNormalization()(x)
+        x = LeakyReLU()(x)
+
+        x = Flatten()(x)
+
+        x = Dense(
+            20
+            , use_bias=False
+            , activation='linear'
+            , kernel_regularizer=regularizers.l2(self.reg_const)
+            )(x)
+
+        x = LeakyReLU()(x)
+
+        x = Dense(
+            1
+            , use_bias=False
+            , activation='tanh'
+            , kernel_regularizer=regularizers.l2(self.reg_const)
+            , name = 'value_head'
+            )(x)
+
+        return (x)
+    
+    # convert output to (8,8,73)-tensor, which assigns a value to each action
+    def policy_head(self, x):
+
+        x = Conv2D(
+        filters = 256
+        , kernel_size = (3,3)
+        , padding = 'same'
+        , use_bias=False
+        , activation='linear'
+        , kernel_regularizer = regularizers.l2(self.reg_const)
+        )(x)
+
+        x = BatchNormalization()(x)
+        x = LeakyReLU()(x)
+        
+        
+        x = Conv2D(
+        filters = 73
+        , kernel_size = (3,3)
+        , padding = 'same'
+        , use_bias=False
+        , activation='linear'
+        , kernel_regularizer = regularizers.l2(self.reg_const)
+        )(x)
+
+        x = BatchNormalization(name = 'policy_head')(x)
+
+        return (x)
+
+    # Create complete model with 1 convolutional layer, 19 residual layers and the value- and policy-head
+    def _build_model(self):
+        
+        tf.keras.backend.set_floatx('float64')
+        main_input = Input(shape = self.input_dim, name = 'main_input')
+        
+        x = self.conv_layer(main_input, 256, (3,3))
+
+        for _ in range(0,NUM_RES_LAYER-1):
+            x = self.residual_layer(x, 256, (3,3))
+        
+        vh = self.value_head(x)
+        ph = self.policy_head(x)
+        
+        model = Model(inputs=[main_input], outputs=[vh, ph])
+        
+        # assigning loss-functions to the model outputs
+        # assigning stochastic gradient descent
+        model.compile(loss={'value_head': 'mean_squared_error', 'policy_head': softmax_cross_entropy_with_logits},
+            optimizer=Adam(learning_rate=self.learning_rate, beta_1=BETA_1, beta_2=BETA_2, epsilon=1e-08,clipnorm = CLIP_NORM),
+            loss_weights={'value_head': 0.5, 'policy_head': 0.5}
+            )
+
+        return model
+
+
+############ loss function for policy head ############
+
+def softmax_cross_entropy_with_logits(y_true, y_pred):
+
+    p = y_pred
+    pi = y_true
+    
+    # replace every not (in the MCTS-algorithm) discovered (and/or illegal) action in the model output with -100 (to have almost no influence due to softmax´s exp-function)
+    zero = tf.zeros(shape = tf.shape(pi),dtype = 'float64')
+   
+    where = tf.equal(pi, zero)
+    negatives = tf.constant(-100, dtype=tf.float64)
+    p = tf.where(where, negatives, p)
+    
+    p = tf.reshape(p,[BATCH_SIZE_2,-1])
+    pi = tf.reshape(pi,[BATCH_SIZE_2,-1])
+    
+    loss = tf.nn.softmax_cross_entropy_with_logits(labels = pi, logits = p)
+    return loss
+
+
+############ Environment ############
+
+class Game:
+    
+    def __init__(self, board = None):
+        # board is a FEN from the class chess
+        if board is None:
+            self.board = chess.Board()
+        else:
+            self.board = board
+        
+        self.input_shape = (8,8,21)
+        self.playerTurn = self._playerTurn()
+        self.id = self._convertBoardToId()
+        self.allowedActions = self._allowedActions()
+    
+    def reset(self):
+        self.board = chess.Board()
+        return Game(self.board)
+    
+    
+    # action as tuple (-,-,-)
+    def step(self, action):
+        next_state, value, done = self.takeAction(action)
+        self.board = next_state.board
+        
+        return ((next_state, value, done))
+    
+    
+    def takeAction(self, action):
+        
+        board_copy = copy(self.board)
+        
+        move = chess.Move.from_uci(array_index_to_move(board_copy, action))
+        
+        board_copy.push(move)
+        
+        newState = Game(board_copy)
+        
+        value = 0
+        done = 0
+        if board_copy.is_game_over():
+            done = 1
+            if board_copy.is_checkmate():
+                # -1 is necessary, because of the usage (compare 'playMatches')
+                value = -1
+            
+        return ((newState, value, done))
+        
+        
+    def _playerTurn(self):
+        # board.turn = True, if white is to move, else black
+        if self.board.turn:
+            playerTurn = 1
+        else:
+            playerTurn = -1
+        
+        return playerTurn
+        
+        
+    # assign an unique ID to every board
+    def _convertBoardToId(self):
+        id = ''.join(self.board.fen().split(' ')[0:-1])
+        
+        return id
+    
+    
+    # get a list of (-,-,-)-tuples representing all allowed moves
+    def _allowedActions(self):
+        allowedActions = [move_to_array_index(str(move)) for move in self.board.legal_moves]
+        
+        return allowedActions
+    
+
+
+############ Tree for MCTS ############
+
+class Node():
+    def __init__(self, state):
+        self.state = state
+        self.playerTurn = state.playerTurn
+        self.id = state.id
+        self.edges = []
+
+    def isLeaf(self):
+        if len(self.edges) > 0:
+            return False
+        else:
+            return True
+
+class Edge():
+    def __init__(self, inNode, outNode, prior, action):
+        # construct unique ID for each edge
+        self.id = inNode.id + '|' + outNode.id
+        self.inNode = inNode 
+        self.outNode = outNode
+        self.playerTurn = inNode.playerTurn
+        self.action = action
+        
+        # each edge gets particular stats (compare MCTS-algorithm)
+        self.stats =  {
+                    'N': 0, # number of simulations through this particular edge
+                    'W': 0, # W = wins * v - loses * v (where v is the changebale output of the value head)
+                    'Q': 0, # Q = W/N (estimated performance between -1 and 1)
+                    'P': prior, # output of the policy head with softmax (compare 'get_preds')
+                }
+
+class MCTS():
+
+    def __init__(self, root):
+        self.root = root # starting node for the simulation
+        self.tree = {}
+        self.addNode(root)
+    
+    # Selection phase of the MCTS-algorithm
+    def moveToLeaf(self):
+        
+        breadcrumbs = [] # list containing current best sequence from root to leaf
+        currentNode = self.root
+
+        done = 0
+        value = 0
+
+        while not currentNode.isLeaf():
+
+            maxQU = -(math.inf) # small value to overwrite with first iteration
+            
+            # first move is almost random, it is distributed around the actual policy with convex combination (compare equation for U)
+            if currentNode == self.root:
+                epsilon = EPSILON
+                nu = np.random.dirichlet([ALPHA] * len(currentNode.edges))
+            else:
+                epsilon = 0
+                nu = [0] * len(currentNode.edges)
+            
+            # sum of all simulations through all edges
+            Nb = 0 
+            for action, edge in currentNode.edges:
+                Nb = Nb + edge.stats['N']
+            
+            for idx, (action, edge) in enumerate(currentNode.edges):
+                
+                # upper confidence bound (according to AlphaGo Zero) including convex combination
+                U = CONST * ((1-epsilon) * edge.stats['P'] + epsilon * nu[idx]) * np.sqrt(Nb) / (1 + edge.stats['N'])
+                Q = edge.stats['Q']
+                # Q+U ist the upper confidence bound (use the action with the highest value)
+                if Q + U > maxQU:
+                    maxQU = Q + U
+                    simulationAction = action
+                    simulationEdge = edge
+            
+            # get value and done if the best action was executed
+            _, value, done = currentNode.state.takeAction(simulationAction)
+            currentNode = simulationEdge.outNode
+            breadcrumbs.append(simulationEdge)
+
+        return currentNode, value, done, breadcrumbs
+
+
+    # Backpropagation-phase of the MCTS-algorithm
+    def backFill(self, leaf, value, breadcrumbs):
+        
+        currentPlayer = leaf.playerTurn
+
+        for edge in breadcrumbs:
+            playerTurn = edge.playerTurn
+            # get the direction for 'W' with comparing the winner with the edges in breadcrumbs
+            if playerTurn == currentPlayer:
+                direction = 1
+            else:
+                direction = -1
+            
+            # update stats for the edges
+            edge.stats['N'] = edge.stats['N'] + 1
+            edge.stats['W'] = edge.stats['W'] + value * direction
+            edge.stats['Q'] = edge.stats['W'] / edge.stats['N']
+    
+    # add node to tree 
+    def addNode(self, node):
+        self.tree[node.id] = node
+
+
+############ Agent for the neural network ############
+
+class Agent():
+    def __init__(self, name, num_simulations, model):
+        self.num_simulations = num_simulations
+        self.model = model
+        self.name = name
+        self.mcts = None # describes the mcts-tree
+
+        self.train_overall_loss = []
+        self.train_value_loss = []
+        self.train_policy_loss = []
+
+    # MCTS-step including selection, expansion, simulation and backpropagation (4 steps of MCTS)
+    def simulate(self):
+        
+        # Selection phase of the MCTS-algorithm
+        leaf, value, done, breadcrumbs = self.mcts.moveToLeaf()
+        
+        # Evaluate the leaf node and expend the tree if the game is not over
+        if done == 0:
+            value = self.evaluateLeaf(leaf)
+                
+        # Backpropagation-phase of the MCTS-algorithm
+        self.mcts.backFill(leaf, value, breadcrumbs)
+        
+
+    # expand the tree for the current state with simulation and use it to choose an action in this particular state
+    def act(self, state, tau):
+        
+        # if there is no tree or the state is not in the tree, build a new one
+        if self.mcts == None or state.id not in self.mcts.tree:
+            self.buildMCTS(state)
+        # otherwise change the root
+        else:
+            self.changeRootMCTS(state)
+        
+        # run the simulation
+        for sim in range(self.num_simulations):
+            self.simulate()
+            
+        # get action values 
+        pi = self.getAV()
+
+        # choose the action
+        action = self.chooseAction(pi, tau)
+
+        return (action, pi)
+
+    # predict the leaf
+    def get_preds(self, state):
+        
+        # convert state to model input
+        inputToModel = FEN_converter(state.board).reshape(1,8,8,21)
+        
+        # get the value-head- and policy-head-output of the model
+        preds = self.model.model(inputToModel)
+        value = preds[0].numpy()[0,0]
+        logits = np.array(preds[1],dtype = 'float64')[0]
+        # get the allowed action in this state
+        allowedActions = state.allowedActions
+        
+        # set in logits not allowed actions to -100
+        mask = np.ones(logits.shape,dtype=bool)
+        for i in range(len(allowedActions)):
+            mask[allowedActions[i]] = False
+            
+        logits[mask] = -100
+        # softmax logits to get probabilities
+        m = np.max(logits)
+        if m > 100:
+            c = 100
+        else:
+            c = m
+        
+        odds = np.exp(c*logits/m)
+        probs = odds / np.sum(odds) 
+        return (value, probs, allowedActions)
+
+    # evaluate the leaf
+    def evaluateLeaf(self, leaf):
+        
+        # predict the leaf
+        value, probs, allowedActions = self.get_preds(leaf.state)
+            
+        for idx, action in enumerate(allowedActions):
+            
+            # get the new state after applying the action
+            newState, _, _ = leaf.state.takeAction(action)
+              
+            # add the new node to the tree
+            if newState.id not in self.mcts.tree:
+                node = Node(newState)
+                self.mcts.addNode(node)
+            # select the node in the tree
+            else:
+                node = self.mcts.tree[newState.id]
+
+            # add the new edge (leaf to new state) to the tree
+            newEdge = Edge(leaf, node, probs[allowedActions[idx]], action)
+            leaf.edges.append((action, newEdge))
+                
+        return value
+
+    # get the action values
+    def getAV(self):
+        edges = self.mcts.root.edges
+        
+        # pi is a tensor with shape of the policy head containing how often the edges are walked through (noramlized, to get probabilities)
+        pi = np.zeros((8,8,73), dtype=np.int64)
+         
+        for action, edge in edges:
+            pi[action] = edge.stats['N']
+        
+        # normalization of pi
+        pi = pi / np.sum(pi) 
+        
+        return pi
+
+    # choose the action
+    def chooseAction(self, pi, tau):
+        # choose a random action from the actions with the highest pi-value
+        if tau == 0:
+            actions = np.argwhere(pi == np.max(pi))
+            action = tuple(random.choice(actions))
+        # choose a random action, but with weighted probabilities (e.g.: pi.flatten() = (0.2, 0.1, 0.4, 0.3) would choose to 20% the first value and so on)
+        else:
+            action_idx = np.random.multinomial(1, pi.flatten()).reshape(8,8,73)
+            action = tuple(np.argwhere(action_idx==1)[0])
+
+        return action
+
+    
+    def replay(self, ltmemory):
+        
+        for i in range(TRAINING_LOOPS):
+            minibatch = random.sample(ltmemory, min(BATCH_SIZE_1, len(ltmemory)))
+
+            training_states = np.array([FEN_converter(row['state'].board) for row in minibatch] ,dtype = 'float64')
+            training_targets = {'value_head': np.array([row['value'] for row in minibatch])
+                                , 'policy_head': np.array([row['AV'] for row in minibatch])} 
+            
+            # update model parameters
+            fit = self.model.model.fit(training_states, training_targets, epochs=EPOCHS, verbose=0, validation_split=0, batch_size = BATCH_SIZE_2)
+            
+            self.train_overall_loss.append(round(fit.history['loss'][EPOCHS - 1],4))
+            self.train_value_loss.append(round(fit.history['value_head_loss'][EPOCHS - 1],4)) 
+            self.train_policy_loss.append(round(fit.history['policy_head_loss'][EPOCHS - 1],4)) 
+        
+        plt.plot(self.train_overall_loss, 'k')
+        plt.legend(['train_overall_loss'], loc='lower left')
+        plt.show()
+        
+        plt.plot((0.5*np.array(self.train_value_loss)).tolist(), 'k')
+        plt.legend(['train_value_loss'], loc='lower left')
+        plt.show()
+        
+        plt.plot((0.5*np.array(self.train_policy_loss)).tolist(), 'k')
+        plt.legend(['train_policy_loss'], loc='lower left')
+        plt.show()
+                
+        plt.plot((np.array(self.train_overall_loss)-(np.array(self.train_value_loss)+np.array(self.train_policy_loss))/2).tolist(), 'k')
+        plt.legend(['train_regularization_loss'], loc='lower left')
+        plt.show()
+        
+    # create tree with new starting root
+    def buildMCTS(self, state):
+        self.root = Node(state)
+        self.mcts = MCTS(self.root)
+    
+    # change root
+    def changeRootMCTS(self, state):
+        self.mcts.root = self.mcts.tree[state.id]
+
+
+############ Memory to train the neural network ############
+
+class Memory:
+    def __init__(self, MEMORY_SIZE):
+        self.MEMORY_SIZE = MEMORY_SIZE
+        # long term memory
+        self.ltmemory = deque(maxlen=MEMORY_SIZE)
+        # short term memory
+        self.stmemory = deque(maxlen=MEMORY_SIZE)
+    
+    # append state and action values to short term memory
+    def commit_stmemory(self, state, actionValues):
+        self.stmemory.append({'state': state, 'AV': actionValues})
+    
+    # append short term memory to long term memory and clear the short term memory
+    def commit_ltmemory(self):
+        for i in self.stmemory:
+            self.ltmemory.append(i)
+        self.clear_stmemory()
+    
+    # clear short term memory
+    def clear_stmemory(self):
+        self.stmemory = deque(maxlen=self.MEMORY_SIZE)
+
+
+############ User plays 1 game against the model ############
+
+# goes_first = 0: User is black, goes_first = 1: User is white
+def model_eval(player, goes_first = 0):
+    
+    # create the environment
+    env = Game()
+    
+    # reset the state to the starting chess position
+    state = env.reset()
+
+    done = 0
+    turn = 0
+    # Reset the tree
+    player.mcts = None 
+
+    # loop over all turns
+    while done == 0:
+        # count the turns
+        turn = turn + 1
+
+        print(env.board)
+        clear_output(wait=True)
+        
+        # if: player_turn, else: user_turn
+        if (turn + goes_first) % 2 == 1:
+            t = time.time()
+            action, _ = player.act(state, 0)
+            elapsed_time = time.time() - t
+            print(elapsed_time)
+        else:
+            action = input('Enter your chosen action: ')
+            
+            if (action == "resign"):
+                break
+            # convert string to chess move
+            try:
+                move = chess.Move.from_uci(action)
+            except:
+                print('illegal notation!!!')
+                turn -= 1
+                continue
+                
+            if move not in env.board.legal_moves:
+                print('illegal move!!!')
+                turn -= 1
+                continue
+            action = move_to_array_index(action)
+
+        # value = -1, if this particular action lead to the end of the game, else value = 0
+        state, _, done = env.step(action) 
+
+
+############ 2 player play several games and build up the memory ############
+
+def playMatches(player1, player2, episodes, turns_until_not_random, memory = None, goes_first = 0):
+    
+    # create the environment
+    env = Game()
+    
+    # counter for: wins for each player and draws
+    scores = {player1.name:0, "drawn": 0, player2.name:0}
+    # counter for: wins for sp = starting player = white pieces // and wins for nsp = not starting player = black pieces
+    sp_scores = {'sp':0, "drawn": 0, 'nsp':0}
+    
+    # loop over the games 
+    for e in range(episodes):
+        print('Episode = ' + str(e+1))
+
+        # reset the state to the starting chess position
+        state = env.reset()
+        
+        done = 0
+        turn = 0
+        # Reset the tree´s
+        player1.mcts = None
+        player2.mcts = None
+        
+        # goes_first = 0 means random player starts, else the starting player can be choosen with -1 and 1
+        if goes_first == 0:
+            player1Starts = random.randint(0,1) * 2 - 1
+        else:
+            player1Starts = goes_first
+        
+        # if player1 is white
+        if player1Starts == 1:
+            # create dictionary to count wins and execute the MCTS-algorithm for the right player
+            players = {1:{"agent": player1, "name":player1.name}
+                    , -1: {"agent": player2, "name":player2.name}
+                    }
+        # if player1 is black
+        else:
+            # create dictionary to count wins and execute the MCTS-algorithm for the right player
+            players = {1:{"agent": player2, "name":player2.name}
+                    , -1: {"agent": player1, "name":player1.name}
+                    }
+        
+        # loop over all turns
+        while done == 0:
+            # count the turns
+            turn = turn + 1
+            
+            # run the MCTS-algorithm and return an action
+            # parameter in act: 1 means first move is (weighted) random (compare chooseAction())
+            if turn < turns_until_not_random:
+                action, pi = players[state.playerTurn]['agent'].act(state, 1)
+            else:
+                action, pi = players[state.playerTurn]['agent'].act(state, 0)
+            
+            # commit the move to the memory
+            if memory != None:
+                memory.commit_stmemory(state, pi)
+
+            # execute the action in the environment
+            # value = -1, if this particular action lead to the end of the game, else value = 0
+            state, value, done = env.step(action) 
+            
+            # if the game is over
+            if done == 1: 
+                print('Amount of turns = ' + str(turn))
+                if memory != None:
+                    # assign the values correctly to the game moves
+                    for move in memory.stmemory:
+                        if move['state'].playerTurn == state.playerTurn:
+                            # losing player moves (value = 1 * -1 = -1)   // in case game was drawn: value = 0
+                            move['value'] = value
+                        else:
+                            # winning player moves (value = -1 * -1 = 1 ) // in case game was drawn: value = 0
+                            move['value'] = -value
+                    # commit all moves to long term memory
+                    memory.commit_ltmemory()     
+                
+                # if 'state.playerTurn' has the finished boardstate -> '-state.playerTurn' makes the winning move
+                # count the wins for each player and for each color
+                if value == -1:
+                    scores[players[-state.playerTurn]['name']] = scores[players[-state.playerTurn]['name']] + 1
+                    print('WON!!!!!')
+                    if state.playerTurn == 1: 
+                        sp_scores['nsp'] = sp_scores['nsp'] + 1
+                    else:
+                        sp_scores['sp'] = sp_scores['sp'] + 1
+                        
+                # if value = 0 count the draws
+                else:
+                    scores['drawn'] = scores['drawn'] + 1
+                    sp_scores['drawn'] = sp_scores['drawn'] + 1
+                    print('draw')
+    return (scores, memory, sp_scores)
+
+
+############ Training of the model ############
+
+def run(old_memory = False, old_model = False):
+    
+    # create new memory if no memory is provided, otherwise get the last memory
+    if not old_memory:
+        memory = Memory(MEMORY_SIZE)
+    else:
+        try:
+            memory = pickle.load(open("memory_ne/memory.p", "rb"))
+        except:
+            print('Memory is not available. A new memory has been created!')
+            memory = Memory(MEMORY_SIZE)
+            
+    # create new model if no model is provided, otherwise get the last model
+    current_NN = myModel()
+    if old_model:
+        try:
+            current_NN.model.load_weights('my_model/model_1/model_mcts')
+        except:
+            print('Model is not available. A new model has been created!')
+        
+    # copy the model
+    best_NN = copy(current_NN)
+    
+    # create the players
+    current_player = Agent('current_player', NUM_SIMULATIONS, current_NN)
+    best_player = Agent('best_player', NUM_SIMULATIONS, best_NN)
+    
+    # every loop represents a self play session, an updating of the network parameters and an evaluation phase to determine the better NN, which will be used afterwards as the new best_NN
+    for iteration in range(MODEL_UPDATES):
+
+        ######## SELF PLAY ########
+        print(str(EPISODES) + ' games of selfplay:')
+        _, memory, _ = playMatches(best_player, best_player, episodes = EPISODES, turns_until_not_random = TURNS_UNTIL_NOT_RANDOM, memory = memory)
+        
+        pickle.dump(memory, open("memory_ne/memory.p", "wb" ))
+        
+        best_NN.model.save_weights('model_ne/model_mcts', overwrite=True, save_format=None, options=None)
+        
+        # start training if memory is big enough
+        if len(memory.ltmemory) >= STARTING_MEMORY_SIZE:
+            
+            ######## RETRAINING #######
+            current_player.replay(memory.ltmemory)
+            
+            if iteration >= START_EVALUATION and iteration % START_EVALUATION == 0:
+                ######## EVALUATING ########
+                print('Evaluation over ' + str(EVAL_EPISODES) + ' games:')
+                
+                scores, _, sp_scores = playMatches(best_player, current_player, episodes = EVAL_EPISODES, turns_until_not_random = 0, memory = None)
+
+                print('current_player: ' + str(scores['current_player']))
+                print('best_player: ' + str(scores['best_player']))
+                print('white_player: ' + str(sp_scores['sp']))
+                print('Black_player: ' + str(sp_scores['nsp']))
+
+                # if current_player wins more than ~55% it is used for the next iteration
+                if scores['current_player'] > scores['best_player'] * SCORING_THRESHOLD:
+                    best_NN.model.set_weights(current_NN.model.get_weights())
+                    print('switched players')
+                    
+                # save memory
+                pickle.dump(memory, open("memory/memory.p", "wb" ))
+                # save model weights
+                best_NN.model.save_weights('model/model_mcts', overwrite=True, save_format=None, options=None)
+                print('saved model/memory')
+                
+    return best_NN
+
+
+############ Train model ############ 
+t = time.time()
+
+best_NN = run(old_memory = False, old_model = False)
+
+elapsed_time = time.time() - t
+print(elapsed_time)
+
+
+# ############ Play a match against the model ############
+
+# current_NN = myModel()
+# current_NN.model.load_weights('my_model/model_1/model_mcts')
+# current_player = Agent('current_player', NUM_SIMULATIONS, current_NN)
+
+# model_eval(current_player, goes_first = 0) 
+
+
+
+
