@@ -1,2 +1,2 @@
 # ChessAI
-An AI for Chess using the MCTS-algorithm
+An AI for Chess using the MCTS-algorithm 
